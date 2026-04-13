@@ -20,6 +20,7 @@ class TestConfig:
     def test_defaults(self):
         c = LCMConfig()
         assert c.fresh_tail_count == 64
+        assert c.fresh_tail_token_budget == 20_000
         assert c.leaf_chunk_tokens == 20_000
         assert c.context_threshold == 0.75
         assert c.condensation_fanin == 4
@@ -34,6 +35,7 @@ class TestConfig:
 
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
+        monkeypatch.setenv("LCM_FRESH_TAIL_TOKENS", "12345")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.80")
         monkeypatch.setenv("LCM_IGNORE_SESSION_PATTERNS", "cron:*,subagent:**")
         monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "telegram:*, cli:debug")
@@ -42,6 +44,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
+        assert c.fresh_tail_token_budget == 12345
         assert c.context_threshold == 0.80
         assert c.ignore_session_patterns == ["cron:*", "subagent:**"]
         assert c.stateless_session_patterns == ["telegram:*", "cli:debug"]
@@ -101,6 +104,22 @@ class TestTokens:
             {"role": "assistant", "content": "world"},
         ]
         assert count_messages_tokens(msgs) > 0
+
+    def test_count_tokens_fallback_cjk_not_undercounted(self, monkeypatch):
+        from hermes_lcm import tokens as token_mod
+
+        monkeypatch.setattr(token_mod, "_encoder_checked", True)
+        monkeypatch.setattr(token_mod, "_encoder", None)
+
+        assert token_mod.count_tokens("你好世界") >= 8
+
+    def test_count_tokens_fallback_ascii_still_reasonable(self, monkeypatch):
+        from hermes_lcm import tokens as token_mod
+
+        monkeypatch.setattr(token_mod, "_encoder_checked", True)
+        monkeypatch.setattr(token_mod, "_encoder", None)
+
+        assert 2 <= token_mod.count_tokens("hello world") <= 4
 
 
 class TestMessageStore:

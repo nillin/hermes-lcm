@@ -13,6 +13,7 @@ class LCMConfig:
 
     # -- Fresh tail: recent messages never compacted ---
     fresh_tail_count: int = 64
+    fresh_tail_token_budget: int = 20_000
 
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers
@@ -70,6 +71,9 @@ class LCMConfig:
         _str = lambda key, default: os.environ.get(key, default)
 
         c.fresh_tail_count = _int("LCM_FRESH_TAIL_COUNT", c.fresh_tail_count)
+        c.fresh_tail_token_budget = _int(
+            "LCM_FRESH_TAIL_TOKENS", c.fresh_tail_token_budget
+        )
         c.leaf_chunk_tokens = _int("LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens)
         c.context_threshold = _float("LCM_CONTEXT_THRESHOLD", c.context_threshold)
         c.incremental_max_depth = _int("LCM_INCREMENTAL_MAX_DEPTH", c.incremental_max_depth)
