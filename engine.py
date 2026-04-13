@@ -94,6 +94,7 @@ class LCMEngine(ContextEngine):
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
         self.protect_last_n = self._config.fresh_tail_count
+        self.tail_token_budget = self._config.fresh_tail_token_budget
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
@@ -159,9 +160,10 @@ class LCMEngine(ContextEngine):
         # Step 1: Ingest new messages into the immutable store
         self._ingest_messages(messages)
 
-        # Step 2: Identify fresh tail boundary
+        # Step 2: Identify fresh tail boundary using token budget with a
+        # message-count floor, and keep tool_call/result groups intact.
         n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._find_tail_cut_by_tokens(messages, head_end=1)
 
         # Protect system prompt (always index 0)
         if fresh_tail_start <= 1:
@@ -234,6 +236,66 @@ class LCMEngine(ContextEngine):
         )
 
         return compressed
+
+    def _align_boundary_forward(self, messages: List[Dict[str, Any]], idx: int) -> int:
+        """Push a boundary forward past any leading tool results."""
+        while idx < len(messages) and messages[idx].get("role") == "tool":
+            idx += 1
+        return idx
+
+    def _align_boundary_backward(self, messages: List[Dict[str, Any]], idx: int) -> int:
+        """Pull a boundary backward to avoid splitting tool groups."""
+        if idx <= 0 or idx >= len(messages):
+            return idx
+
+        check = idx - 1
+        while check >= 0 and messages[check].get("role") == "tool":
+            check -= 1
+
+        if (
+            check >= 0
+            and messages[check].get("role") == "assistant"
+            and messages[check].get("tool_calls")
+        ):
+            return check
+        return idx
+
+    def _find_tail_cut_by_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        head_end: int,
+        token_budget: Optional[int] = None,
+    ) -> int:
+        """Find where the protected fresh tail should start.
+
+        Uses token budget as the primary criterion with ``fresh_tail_count`` as a
+        hard minimum floor. The returned cut index is aligned so tool call/result
+        groups stay together.
+        """
+        budget = token_budget if token_budget is not None else self.tail_token_budget
+        n = len(messages)
+        if n <= head_end + 1:
+            return n
+
+        min_tail = min(self._config.fresh_tail_count, max(0, n - head_end - 1))
+        accumulated = 0
+        cut_idx = n
+
+        for i in range(n - 1, head_end - 1, -1):
+            msg_tokens = count_message_tokens(messages[i])
+            if accumulated + msg_tokens > budget and (n - i) >= min_tail:
+                break
+            accumulated += msg_tokens
+            cut_idx = i
+
+        fallback_cut = n - min_tail
+        if cut_idx > fallback_cut:
+            cut_idx = fallback_cut
+        if cut_idx <= head_end:
+            cut_idx = max(fallback_cut, head_end + 1)
+
+        cut_idx = self._align_boundary_backward(messages, cut_idx)
+        return max(cut_idx, head_end + 1)
 
     # -- ContextEngine optional methods ------------------------------------
 

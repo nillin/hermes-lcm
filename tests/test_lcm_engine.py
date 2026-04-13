@@ -262,6 +262,51 @@ class TestEngineCompress:
         finally:
             esc._call_llm_for_summary = original_fn
 
+    def test_compress_keeps_tool_group_with_tail(self, engine):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "old question " + "x" * 80},
+            {"role": "assistant", "content": "old answer " + "y" * 80},
+            {"role": "user", "content": "run the tool"},
+            {
+                "role": "assistant",
+                "content": "Running tool",
+                "tool_calls": [
+                    {"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "content": "tool output", "tool_call_id": "tc1"},
+        ]
+        engine._config.fresh_tail_count = 1
+        engine._config.fresh_tail_token_budget = 1
+        engine.tail_token_budget = 1
+        engine._session_id = "test-session"
+
+        import hermes_lcm.escalation as esc
+        original_fn = esc._call_llm_for_summary
+
+        def mock_summarize(prompt, max_tokens, model=""):
+            return "Mock summary.\nExpand for details about: tool boundary"
+
+        esc._call_llm_for_summary = mock_summarize
+        try:
+            result = engine.compress(messages)
+            assert result[-2]["role"] == "assistant"
+            assert result[-2].get("tool_calls")
+            assert result[-1]["role"] == "tool"
+            assert result[-1].get("tool_call_id") == "tc1"
+        finally:
+            esc._call_llm_for_summary = original_fn
+
+    def test_find_tail_cut_by_tokens_respects_message_floor(self, engine):
+        messages = self._make_long_conversation(6)
+        engine._config.fresh_tail_count = 4
+        engine._config.fresh_tail_token_budget = 1
+        engine.tail_token_budget = 1
+
+        cut = engine._find_tail_cut_by_tokens(messages, head_end=1)
+        assert len(messages) - cut >= 4
+
 
 class TestPostCompactionIngestion:
     """Regression tests for issue #1 — messages must be persisted after
