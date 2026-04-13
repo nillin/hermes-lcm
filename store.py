@@ -16,6 +16,47 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _has_cjk_or_emoji(text: str) -> bool:
+    """Check if text contains CJK ideographs, Hangul, or emoji.
+
+    FTS5 with default unicode61 tokenizer struggles with CJK characters
+    (especially CJK Unified Ideographs) and emoji. Use LIKE fallback.
+    """
+    for ch in text:
+        cp = ord(ch)
+        if (
+            0x4E00 <= cp <= 0x9FFF      # CJK Unified Ideographs
+            or 0x3400 <= cp <= 0x4DBF   # CJK Extension A
+            or 0xF900 <= cp <= 0xFAFF   # CJK Compatibility
+            or 0x3040 <= cp <= 0x309F   # Hiragana
+            or 0x30A0 <= cp <= 0x30FF   # Katakana
+            or 0xAC00 <= cp <= 0xD7AF   # Hangul Syllables
+            or 0x1F000 <= cp <= 0x1FFFF # Emoji (various blocks)
+            or 0x2600 <= cp <= 0x26FF   # Misc Symbols
+            or 0x2700 <= cp <= 0x27BF   # Dingbats
+            or 0xFE00 <= cp <= 0xFE0F   # Variation Selectors
+            or 0x200D == cp             # Zero Width Joiner
+        ):
+            return True
+    return False
+
+
+def _generate_snippet(content: str, query: str, context_chars: int = 40) -> str:
+    """Generate a snippet with >>> <<< markers around the query match."""
+    if not content or not query:
+        return content[:120] if content else ""
+    idx = content.find(query)
+    if idx < 0:
+        return content[:120]
+    start = max(0, idx - context_chars)
+    end = min(len(content), idx + len(query) + context_chars)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(content) else ""
+    matched = content[idx:idx + len(query)]
+    after = content[idx + len(query):end]
+    return f"{prefix}{content[start:idx]}>>>{matched}<<<{after}{suffix}"
+
+
 class MessageStore:
     """SQLite-backed immutable message store."""
 
@@ -200,32 +241,69 @@ class MessageStore:
 
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20) -> List[Dict[str, Any]]:
-        """FTS5 search across messages. Returns matches with snippets."""
-        if session_id:
-            rows = self._conn.execute(
-                """SELECT m.*, snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                   FROM messages_fts fts
-                   JOIN messages m ON m.store_id = fts.rowid
-                   WHERE messages_fts MATCH ? AND m.session_id = ?
-                   ORDER BY rank LIMIT ?""",
-                (query, session_id, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """SELECT m.*, snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                   FROM messages_fts fts
-                   JOIN messages m ON m.store_id = fts.rowid
-                   WHERE messages_fts MATCH ?
-                   ORDER BY rank LIMIT ?""",
-                (query, limit),
-            ).fetchall()
+        """Search across messages. Uses FTS5 for ASCII queries,
+        LIKE fallback for CJK/emoji content (FTS5 unicode61 fails on these).
+        """
         results = []
-        for r in rows:
-            d = self._row_to_dict(r)
-            # snippet is the extra column
-            d["snippet"] = r[-1] if len(r) > 10 else ""
-            results.append(d)
-        return results
+        seen_ids = set()
+
+        # Always try FTS5 first (works for ASCII, Hangul, Hiragana)
+        try:
+            if session_id:
+                rows = self._conn.execute(
+                    """SELECT m.*, snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                       FROM messages_fts fts
+                       JOIN messages m ON m.store_id = fts.rowid
+                       WHERE messages_fts MATCH ? AND m.session_id = ?
+                       ORDER BY rank LIMIT ?""",
+                    (query, session_id, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT m.*, snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                       FROM messages_fts fts
+                       JOIN messages m ON m.store_id = fts.rowid
+                       WHERE messages_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (query, limit),
+                ).fetchall()
+            for r in rows:
+                d = self._row_to_dict(r)
+                d["snippet"] = r[-1] if len(r) > 10 else ""
+                results.append(d)
+                seen_ids.add(d.get("store_id"))
+        except Exception:
+            pass
+
+        # LIKE fallback for CJK/emoji queries (FTS5 misses these)
+        if _has_cjk_or_emoji(query):
+            like_pattern = f"%{query}%"
+            try:
+                if session_id:
+                    like_rows = self._conn.execute(
+                        """SELECT * FROM messages
+                           WHERE content LIKE ? AND session_id = ?
+                           ORDER BY store_id LIMIT ?""",
+                        (like_pattern, session_id, limit),
+                    ).fetchall()
+                else:
+                    like_rows = self._conn.execute(
+                        """SELECT * FROM messages
+                           WHERE content LIKE ?
+                           ORDER BY store_id LIMIT ?""",
+                        (like_pattern, limit),
+                    ).fetchall()
+                for r in like_rows:
+                    d = self._row_to_dict(r)
+                    sid = d.get("store_id")
+                    if sid not in seen_ids:
+                        d["snippet"] = _generate_snippet(d.get("content", ""), query)
+                        results.append(d)
+                        seen_ids.add(sid)
+            except Exception:
+                pass
+
+        return results[:limit]
 
     # -- Helpers ------------------------------------------------------------
 

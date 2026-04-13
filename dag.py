@@ -13,6 +13,8 @@ Depth semantics:
 
 import json
 import logging
+
+from .store import _has_cjk_or_emoji, _generate_snippet
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -206,24 +208,62 @@ class SummaryDAG:
 
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20) -> List[SummaryNode]:
-        """FTS5 search across all summary nodes."""
-        if session_id:
-            rows = self._conn.execute(
-                """SELECT n.* FROM nodes_fts fts
-                   JOIN summary_nodes n ON n.node_id = fts.rowid
-                   WHERE nodes_fts MATCH ? AND n.session_id = ?
-                   ORDER BY rank LIMIT ?""",
-                (query, session_id, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """SELECT n.* FROM nodes_fts fts
-                   JOIN summary_nodes n ON n.node_id = fts.rowid
-                   WHERE nodes_fts MATCH ?
-                   ORDER BY rank LIMIT ?""",
-                (query, limit),
-            ).fetchall()
-        return [self._row_to_node(r) for r in rows]
+        """Search summary nodes. FTS5 + LIKE fallback for CJK/emoji."""
+        results: List[SummaryNode] = []
+        seen_ids = set()
+
+        # FTS5 first
+        try:
+            if session_id:
+                rows = self._conn.execute(
+                    """SELECT n.* FROM nodes_fts fts
+                       JOIN summary_nodes n ON n.node_id = fts.rowid
+                       WHERE nodes_fts MATCH ? AND n.session_id = ?
+                       ORDER BY rank LIMIT ?""",
+                    (query, session_id, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT n.* FROM nodes_fts fts
+                       JOIN summary_nodes n ON n.node_id = fts.rowid
+                       WHERE nodes_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (query, limit),
+                ).fetchall()
+            for r in rows:
+                node = self._row_to_node(r)
+                results.append(node)
+                seen_ids.add(node.node_id)
+        except Exception:
+            pass
+
+        # LIKE fallback for CJK/emoji
+        if _has_cjk_or_emoji(query):
+            like_pattern = f"%{query}%"
+            try:
+                if session_id:
+                    like_rows = self._conn.execute(
+                        """SELECT * FROM summary_nodes
+                           WHERE summary LIKE ? AND session_id = ?
+                           ORDER BY created_at LIMIT ?""",
+                        (like_pattern, session_id, limit),
+                    ).fetchall()
+                else:
+                    like_rows = self._conn.execute(
+                        """SELECT * FROM summary_nodes
+                           WHERE summary LIKE ?
+                           ORDER BY created_at LIMIT ?""",
+                        (like_pattern, limit),
+                    ).fetchall()
+                for r in like_rows:
+                    node = self._row_to_node(r)
+                    if node.node_id not in seen_ids:
+                        results.append(node)
+                        seen_ids.add(node.node_id)
+            except Exception:
+                pass
+
+        return results[:limit]
 
     # -- DAG traversal ------------------------------------------------------
 
